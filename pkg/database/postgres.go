@@ -12,14 +12,17 @@ import (
 var DB *sql.DB
 
 func Connect() {
-	dsn := fmt.Sprintf(
-		"host=%s port=%s user=%s password=%s dbname=%s sslmode=require",
-		os.Getenv("DB_HOST"),
-		os.Getenv("DB_PORT"),
-		os.Getenv("DB_USER"),
-		os.Getenv("DB_PASSWORD"),
-		os.Getenv("DB_NAME"),
-	)
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		dsn = fmt.Sprintf(
+			"host=%s port=%s user=%s password=%s dbname=%s sslmode=require",
+			os.Getenv("DB_HOST"),
+			os.Getenv("DB_PORT"),
+			os.Getenv("DB_USER"),
+			os.Getenv("DB_PASSWORD"),
+			os.Getenv("DB_NAME"),
+		)
+	}
 
 	var err error
 	DB, err = sql.Open("postgres", dsn)
@@ -34,5 +37,5 @@ func Connect() {
 	DB.SetMaxOpenConns(25)
 	DB.SetMaxIdleConns(5)
 
-	log.Println("✅ PostgreSQL connected")
+	log.Println("PostgreSQL connected successfully")
 }
