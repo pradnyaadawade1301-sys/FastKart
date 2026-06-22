@@ -23,7 +23,7 @@ import (
 )
 
 func main() {
-	godotenv.Load("../../.env")
+	godotenv.Load()
 	database.Connect()
 	defer database.DB.Close()
 

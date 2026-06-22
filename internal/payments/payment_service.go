@@ -2,7 +2,10 @@
 package payments
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"log"
@@ -12,48 +15,37 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/gorilla/mux"
-	stripe "github.com/stripe/stripe-go/v76"
-	"github.com/stripe/stripe-go/v76/paymentintent"
-	stripRefund "github.com/stripe/stripe-go/v76/refund"
-	"github.com/stripe/stripe-go/v76/webhook"
+	razorpay "github.com/razorpay/razorpay-go"
 )
 
 type PaymentService struct {
-	DB *sql.DB
+	DB     *sql.DB
+	Client *razorpay.Client
 }
 
+// NAYA - warning de aur aage badho
 func NewPaymentService(db *sql.DB) *PaymentService {
-	stripe.Key = os.Getenv("STRIPE_SECRET_KEY")
-	if stripe.Key == "" {
-		log.Fatal("❌ STRIPE_SECRET_KEY not set in .env")
-	}
-	return &PaymentService{DB: db}
+    keyID := os.Getenv("RAZORPAY_KEY_ID")
+    keySecret := os.Getenv("RAZORPAY_KEY_SECRET")
+    if keyID == "" || keySecret == "" {
+        log.Println("⚠️  RAZORPAY_KEY_ID / RAZORPAY_KEY_SECRET not set - payment disabled")
+        return &PaymentService{DB: db, Client: nil}
+    }
+    client := razorpay.NewClient(keyID, keySecret)
+    return &PaymentService{DB: db, Client: client}
 }
-
-// RegisterRoutes — webhook ko auth middleware se BAHAR rakhna zaroori hai
-// main.go mein:
-//   public := r.PathPrefix("").Subrouter()
-//   public.HandleFunc("/payments/stripe/webhook", paymentSvc.HandleWebhook).Methods("POST")
-//   protected := r.PathPrefix("").Subrouter()
-//   protected.Use(authMiddleware)
-//   paymentSvc.RegisterRoutes(protected)
 func (s *PaymentService) RegisterRoutes(r *mux.Router) {
 	r.HandleFunc("/payments/wallet/add", s.AddWalletBalance).Methods("POST")
 	r.HandleFunc("/payments/wallet/balance", s.GetWalletBalance).Methods("GET")
 	r.HandleFunc("/payments/wallet/transactions", s.GetTransactions).Methods("GET")
 
-	r.HandleFunc("/payments/stripe/intent", s.CreatePaymentIntent).Methods("POST")
-	r.HandleFunc("/payments/stripe/verify", s.VerifyPayment).Methods("POST")
-	r.HandleFunc("/payments/stripe/refund", s.RefundPayment).Methods("POST")
-	r.HandleFunc("/payments/stripe/history", s.GetStripeTransactions).Methods("GET")
-	// NOTE: /payments/stripe/webhook — yahan register MAT karo, main.go mein public subrouter pe karo
+	r.HandleFunc("/payments/razorpay/order", s.CreateOrder).Methods("POST")
+	r.HandleFunc("/payments/razorpay/verify", s.VerifyPayment).Methods("POST")
+	r.HandleFunc("/payments/razorpay/refund", s.RefundPayment).Methods("POST")
+	r.HandleFunc("/payments/razorpay/history", s.GetRazorpayTransactions).Methods("GET")
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// POST /payments/stripe/intent
-// ─────────────────────────────────────────────────────────────────────────────
-func (s *PaymentService) CreatePaymentIntent(w http.ResponseWriter, r *http.Request) {
-	// FIX 1: nil panic se bachao
+func (s *PaymentService) CreateOrder(w http.ResponseWriter, r *http.Request) {
 	userID, ok := r.Context().Value("user_id").(string)
 	if !ok || userID == "" {
 		jsonError(w, "Unauthorized", http.StatusUnauthorized)
@@ -70,77 +62,69 @@ func (s *PaymentService) CreatePaymentIntent(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	if req.Currency == "" {
-		req.Currency = "inr"
+		req.Currency = "INR"
 	}
 
 	amountPaise := int64(req.Amount * 100)
 
-	params := &stripe.PaymentIntentParams{
-		Amount:   stripe.Int64(amountPaise),
-		Currency: stripe.String(req.Currency),
-		AutomaticPaymentMethods: &stripe.PaymentIntentAutomaticPaymentMethodsParams{
-			Enabled: stripe.Bool(true),
-		},
-		Metadata: map[string]string{
+	data := map[string]interface{}{
+		"amount":   amountPaise,
+		"currency": req.Currency,
+		"receipt":  req.OrderID,
+		"notes": map[string]interface{}{
 			"order_id": req.OrderID,
 			"user_id":  userID,
 			"app":      "fastkart",
 		},
 	}
 
-	pi, err := paymentintent.New(params)
+	rzpOrder, err := s.Client.Order.Create(data, nil)
 	if err != nil {
-		log.Printf("Stripe PaymentIntent error: %v", err)
+		log.Printf("Razorpay order create error: %v", err)
 		jsonError(w, "Payment initiation failed", http.StatusInternalServerError)
 		return
 	}
 
-	// FIX 2: database.DB ki jagah s.DB use karo
+	rzpOrderID := rzpOrder["id"].(string)
+
 	_, dbErr := s.DB.Exec(`
-		INSERT INTO stripe_transactions
-			(id, user_id, order_id, payment_intent_id, amount, currency, status, created_at, updated_at)
-		VALUES ($1,$2,$3,$4,$5,$6,'pending',NOW(),NOW())
-		ON CONFLICT (payment_intent_id) DO NOTHING`,
-		uuid.New().String(), userID, req.OrderID, pi.ID, req.Amount, req.Currency,
+		INSERT INTO razorpay_transactions
+			(id, user_id, order_id, razorpay_order_id, amount, currency, status, created_at, updated_at)
+		VALUES ($1,$2,$3,$4,$5,$6,'created',NOW(),NOW())
+		ON CONFLICT (razorpay_order_id) DO NOTHING`,
+		uuid.New().String(), userID, req.OrderID, rzpOrderID, req.Amount, req.Currency,
 	)
 	if dbErr != nil {
-		log.Printf("stripe_transactions insert error: %v", dbErr)
+		log.Printf("razorpay_transactions insert error: %v", dbErr)
 	}
 
 	jsonResp(w, map[string]interface{}{
-		"client_secret":     pi.ClientSecret,
-		"payment_intent_id": pi.ID,
+		"razorpay_order_id": rzpOrderID,
 		"amount":            req.Amount,
 		"currency":          req.Currency,
+		"key_id":            os.Getenv("RAZORPAY_KEY_ID"),
 	})
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// POST /payments/stripe/verify
-// ─────────────────────────────────────────────────────────────────────────────
 func (s *PaymentService) VerifyPayment(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		OrderID         string `json:"order_id"`
-		PaymentIntentID string `json:"payment_intent_id"`
+		OrderID           string `json:"order_id"`
+		RazorpayOrderID   string `json:"razorpay_order_id"`
+		RazorpayPaymentID string `json:"razorpay_payment_id"`
+		RazorpaySignature string `json:"razorpay_signature"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.PaymentIntentID == "" {
-		jsonError(w, "payment_intent_id required", http.StatusBadRequest)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil ||
+		req.RazorpayOrderID == "" || req.RazorpayPaymentID == "" || req.RazorpaySignature == "" {
+		jsonError(w, "razorpay_order_id, razorpay_payment_id, razorpay_signature required", http.StatusBadRequest)
 		return
 	}
 
-	pi, err := paymentintent.Get(req.PaymentIntentID, nil)
-	if err != nil {
-		log.Printf("Stripe intent fetch error: %v", err)
-		jsonError(w, "Could not verify payment", http.StatusBadGateway)
+	secret := os.Getenv("RAZORPAY_KEY_SECRET")
+	if !verifySignature(req.RazorpayOrderID, req.RazorpayPaymentID, req.RazorpaySignature, secret) {
+		jsonError(w, "Invalid payment signature", http.StatusPaymentRequired)
 		return
 	}
 
-	if pi.Status != stripe.PaymentIntentStatusSucceeded {
-		jsonError(w, "Payment not completed. Status: "+string(pi.Status), http.StatusPaymentRequired)
-		return
-	}
-
-	// FIX 3: transaction error properly handle karo
 	tx, err := s.DB.Begin()
 	if err != nil {
 		jsonError(w, "DB transaction failed", http.StatusInternalServerError)
@@ -158,9 +142,9 @@ func (s *PaymentService) VerifyPayment(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if _, err := tx.Exec(`
-		UPDATE stripe_transactions
-		SET status = 'succeeded', updated_at = NOW()
-		WHERE payment_intent_id = $1`, req.PaymentIntentID); err != nil {
+		UPDATE razorpay_transactions
+		SET status = 'paid', razorpay_payment_id = $1, updated_at = NOW()
+		WHERE razorpay_order_id = $2`, req.RazorpayPaymentID, req.RazorpayOrderID); err != nil {
 		log.Printf("Transaction update error: %v", err)
 	}
 
@@ -170,72 +154,66 @@ func (s *PaymentService) VerifyPayment(w http.ResponseWriter, r *http.Request) {
 	}
 
 	jsonResp(w, map[string]interface{}{
-		"success":           true,
-		"message":           "Payment verified successfully",
-		"order_id":          req.OrderID,
-		"payment_intent_id": req.PaymentIntentID,
-		"status":            "paid",
+		"success":             true,
+		"message":             "Payment verified successfully",
+		"order_id":            req.OrderID,
+		"razorpay_payment_id": req.RazorpayPaymentID,
+		"status":              "paid",
 	})
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// POST /payments/stripe/refund
-// ─────────────────────────────────────────────────────────────────────────────
+func verifySignature(orderID, paymentID, signature, secret string) bool {
+	data := orderID + "|" + paymentID
+	h := hmac.New(sha256.New, []byte(secret))
+	h.Write([]byte(data))
+	expected := hex.EncodeToString(h.Sum(nil))
+	return hmac.Equal([]byte(expected), []byte(signature))
+}
+
 func (s *PaymentService) RefundPayment(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		PaymentIntentID string  `json:"payment_intent_id"`
-		AmountINR       float64 `json:"amount_inr"`
-		Reason          string  `json:"reason"`
+		RazorpayPaymentID string  `json:"razorpay_payment_id"`
+		AmountINR         float64 `json:"amount_inr"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.PaymentIntentID == "" {
-		jsonError(w, "payment_intent_id required", http.StatusBadRequest)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.RazorpayPaymentID == "" {
+		jsonError(w, "razorpay_payment_id required", http.StatusBadRequest)
 		return
 	}
 
-	params := &stripe.RefundParams{
-		PaymentIntent: stripe.String(req.PaymentIntentID),
+	data := map[string]interface{}{
+		"payment_id": req.RazorpayPaymentID,
 	}
 	if req.AmountINR > 0 {
-		params.Amount = stripe.Int64(int64(req.AmountINR * 100))
-	}
-	switch req.Reason {
-	case "duplicate":
-		params.Reason = stripe.String(string(stripe.RefundReasonDuplicate))
-	case "fraudulent":
-		params.Reason = stripe.String(string(stripe.RefundReasonFraudulent))
-	default:
-		params.Reason = stripe.String(string(stripe.RefundReasonRequestedByCustomer))
+		data["amount"] = int64(req.AmountINR * 100)
 	}
 
-	rf, err := stripRefund.New(params)
+	rf, err := s.Client.Refund.Create(data, nil)
 	if err != nil {
-		log.Printf("Stripe refund error: %v", err)
+		log.Printf("Razorpay refund error: %v", err)
 		jsonError(w, "Refund failed", http.StatusInternalServerError)
 		return
 	}
 
-	// FIX 2: s.DB use karo
 	s.DB.Exec(`
-		UPDATE stripe_transactions
+		UPDATE razorpay_transactions
 		SET status = 'refunded', updated_at = NOW()
-		WHERE payment_intent_id = $1`, req.PaymentIntentID)
+		WHERE razorpay_payment_id = $1`, req.RazorpayPaymentID)
 
 	refundedINR := req.AmountINR
 	if refundedINR == 0 {
-		refundedINR = float64(rf.Amount) / 100
+		if amt, ok := rf["amount"].(float64); ok {
+			refundedINR = amt / 100
+		}
 	}
 
 	jsonResp(w, map[string]interface{}{
 		"success":   true,
-		"refund_id": rf.ID,
-		"status":    string(rf.Status),
+		"refund_id": rf["id"],
+		"status":    rf["status"],
 		"amount":    refundedINR,
 	})
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// POST /payments/stripe/webhook  — auth middleware BYPASS karke register karo
-// ─────────────────────────────────────────────────────────────────────────────
 func (s *PaymentService) HandleWebhook(w http.ResponseWriter, r *http.Request) {
 	const maxBodyBytes = int64(65536)
 	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
@@ -246,51 +224,59 @@ func (s *PaymentService) HandleWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// FIX 4: webhook secret empty check
-	webhookSecret := os.Getenv("STRIPE_WEBHOOK_SECRET")
+	webhookSecret := os.Getenv("RAZORPAY_WEBHOOK_SECRET")
 	if webhookSecret == "" {
-		log.Println("❌ STRIPE_WEBHOOK_SECRET not set!")
+		log.Println("❌ RAZORPAY_WEBHOOK_SECRET not set!")
 		jsonError(w, "Webhook not configured", http.StatusInternalServerError)
 		return
 	}
 
-	event, err := webhook.ConstructEvent(payload, r.Header.Get("Stripe-Signature"), webhookSecret)
-	if err != nil {
-		log.Printf("Webhook signature invalid: %v", err)
+	signature := r.Header.Get("X-Razorpay-Signature")
+	h := hmac.New(sha256.New, []byte(webhookSecret))
+	h.Write(payload)
+	expected := hex.EncodeToString(h.Sum(nil))
+	if !hmac.Equal([]byte(expected), []byte(signature)) {
 		jsonError(w, "Invalid signature", http.StatusBadRequest)
 		return
 	}
 
-	switch event.Type {
-	case "payment_intent.succeeded":
-		piID, _ := event.Data.Object["id"].(string)
-		s.DB.Exec(`
-			UPDATE stripe_transactions SET status='succeeded', updated_at=NOW()
-			WHERE payment_intent_id=$1`, piID)
-		log.Printf("✅ Webhook: payment succeeded %s", piID)
+	var event struct {
+		Event   string `json:"event"`
+		Payload struct {
+			Payment struct {
+				Entity struct {
+					ID      string `json:"id"`
+					OrderID string `json:"order_id"`
+				} `json:"entity"`
+			} `json:"payment"`
+		} `json:"payload"`
+	}
+	if err := json.Unmarshal(payload, &event); err != nil {
+		jsonError(w, "Invalid payload", http.StatusBadRequest)
+		return
+	}
 
-	case "payment_intent.payment_failed":
-		piID, _ := event.Data.Object["id"].(string)
+	switch event.Event {
+	case "payment.captured":
 		s.DB.Exec(`
-			UPDATE stripe_transactions SET status='failed', updated_at=NOW()
-			WHERE payment_intent_id=$1`, piID)
-		log.Printf("❌ Webhook: payment failed %s", piID)
+			UPDATE razorpay_transactions SET status='paid', razorpay_payment_id=$1, updated_at=NOW()
+			WHERE razorpay_order_id=$2`, event.Payload.Payment.Entity.ID, event.Payload.Payment.Entity.OrderID)
+		log.Printf("✅ Webhook: payment captured %s", event.Payload.Payment.Entity.ID)
 
-	case "charge.refunded":
-		log.Printf("💸 Webhook: charge refunded %v", event.Data.Object["id"])
+	case "payment.failed":
+		s.DB.Exec(`
+			UPDATE razorpay_transactions SET status='failed', updated_at=NOW()
+			WHERE razorpay_order_id=$1`, event.Payload.Payment.Entity.OrderID)
+		log.Printf("❌ Webhook: payment failed %s", event.Payload.Payment.Entity.ID)
 
 	default:
-		log.Printf("ℹ️  Unhandled webhook event: %s", event.Type)
+		log.Printf("ℹ️  Unhandled webhook event: %s", event.Event)
 	}
 
 	w.WriteHeader(http.StatusOK)
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// GET /payments/stripe/history
-// ─────────────────────────────────────────────────────────────────────────────
-func (s *PaymentService) GetStripeTransactions(w http.ResponseWriter, r *http.Request) {
-	// FIX 1: nil panic se bachao
+func (s *PaymentService) GetRazorpayTransactions(w http.ResponseWriter, r *http.Request) {
 	userID, ok := r.Context().Value("user_id").(string)
 	if !ok || userID == "" {
 		jsonError(w, "Unauthorized", http.StatusUnauthorized)
@@ -298,8 +284,8 @@ func (s *PaymentService) GetStripeTransactions(w http.ResponseWriter, r *http.Re
 	}
 
 	rows, err := s.DB.Query(`
-		SELECT id, order_id, payment_intent_id, amount, currency, status, created_at
-		FROM stripe_transactions
+		SELECT id, order_id, razorpay_order_id, amount, currency, status, created_at
+		FROM razorpay_transactions
 		WHERE user_id = $1
 		ORDER BY created_at DESC LIMIT 50`, userID)
 	if err != nil {
@@ -308,20 +294,20 @@ func (s *PaymentService) GetStripeTransactions(w http.ResponseWriter, r *http.Re
 	}
 	defer rows.Close()
 
-	type StripeTxn struct {
+	type Txn struct {
 		ID              string    `json:"id"`
 		OrderID         string    `json:"order_id"`
-		PaymentIntentID string    `json:"payment_intent_id"`
+		RazorpayOrderID string    `json:"razorpay_order_id"`
 		Amount          float64   `json:"amount"`
 		Currency        string    `json:"currency"`
 		Status          string    `json:"status"`
 		CreatedAt       time.Time `json:"created_at"`
 	}
 
-	txns := []StripeTxn{}
+	txns := []Txn{}
 	for rows.Next() {
-		var t StripeTxn
-		rows.Scan(&t.ID, &t.OrderID, &t.PaymentIntentID, &t.Amount, &t.Currency, &t.Status, &t.CreatedAt)
+		var t Txn
+		rows.Scan(&t.ID, &t.OrderID, &t.RazorpayOrderID, &t.Amount, &t.Currency, &t.Status, &t.CreatedAt)
 		txns = append(txns, t)
 	}
 
@@ -330,10 +316,6 @@ func (s *PaymentService) GetStripeTransactions(w http.ResponseWriter, r *http.Re
 		"count":        len(txns),
 	})
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Wallet handlers
-// ─────────────────────────────────────────────────────────────────────────────
 
 func (s *PaymentService) AddWalletBalance(w http.ResponseWriter, r *http.Request) {
 	userID, ok := r.Context().Value("user_id").(string)

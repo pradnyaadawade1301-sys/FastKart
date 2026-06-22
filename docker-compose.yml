@@ -1,0 +1,75 @@
+# FastKart — Local development setup
+# Usage: docker compose up -d
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB:       fastkart
+      POSTGRES_USER:     fastkart
+      POSTGRES_PASSWORD: fastkart_dev_pass
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./migrations:/docker-entrypoint-initdb.d   # auto-run on first start
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fastkart"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --maxmemory 128mb --maxmemory-policy allkeys-lru
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      # Database
+      DB_HOST:     db
+      DB_PORT:     5432
+      DB_USER:     fastkart
+      DB_PASSWORD: fastkart_dev_pass
+      DB_NAME:     fastkart
+      # Redis
+      REDIS_URL:      redis:6379
+      REDIS_PASSWORD: ""
+      # JWT — production mein strong secret daalo
+      JWT_SECRET: fastkart_dev_secret_change_in_prod
+      # Stripe — dashboard.stripe.com se lo
+      STRIPE_SECRET_KEY:      sk_test_XXXXXXXXXX
+      STRIPE_WEBHOOK_SECRET:  whsec_XXXXXXXXXX
+      # FCM — Firebase Console se lo
+      FCM_SERVER_KEY: ""
+      # App
+      PORT: "8080"
+      GIN_MODE: debug   # production mein "release"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  pgdata:
+  redisdata:
